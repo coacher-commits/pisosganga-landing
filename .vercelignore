@@ -1,0 +1,10 @@
+*.py
+*.db
+*.log
+*.sh
+*.service
+venv/
+__pycache__/
+scrapers/
+.env
+requirements.txt

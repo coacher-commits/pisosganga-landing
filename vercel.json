@@ -1,0 +1,15 @@
+{
+  "buildCommand": "",
+  "outputDirectory": ".",
+  "framework": null,
+  "rewrites": [
+    {
+      "source": "/p/:id",
+      "destination": "http://178.104.108.198:8080/p/:id"
+    },
+    {
+      "source": "/health",
+      "destination": "http://178.104.108.198:8080/health"
+    }
+  ]
+}
