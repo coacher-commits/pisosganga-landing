@@ -1,0 +1,21 @@
+[Unit]
+Description=AlphaTon Alert Monitor — SEC + Etherscan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/alphaton-monitor
+EnvironmentFile=/opt/alphaton-monitor/.env
+
+ExecStart=/usr/bin/python3 /opt/alphaton-monitor/sec_alphaton_monitor.py
+Restart=on-failure
+RestartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alphaton-monitor
+
+[Install]
+WantedBy=multi-user.target
