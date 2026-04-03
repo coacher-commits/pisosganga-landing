@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-SEC AlphaTon Alert Monitor
-==========================
-Polls the SEC EDGAR full-text search API and SEC news feeds for any mention
-of "AlphaTon". Sends a Telegram message when new results are detected.
+AlphaTon Alert Monitor — SEC + Etherscan
+=========================================
+Monitors two independent sources and sends Telegram alerts:
+
+  1. SEC (EDGAR full-text search, press-release / litigation RSS, company feed)
+       → any document mentioning "AlphaTon"
+       → checked every SEC_CHECK_INTERVAL_SECS (default 3600 s / 1 h)
+
+  2. Etherscan ERC-20 token transfers
+       → contract 0xd9016a907dc0ecfa3ca425ab20b6b785b42f2373
+       → only transfers >= MIN_TOKEN_AMOUNT tokens (default 500 000)
+       → checked every ETH_CHECK_INTERVAL_SECS (default 300 s / 5 min)
 
 Usage:
-    python3 sec_alphaton_monitor.py
+    python3 sec_alphaton_monitor.py          # continuous daemon
+    python3 sec_alphaton_monitor.py --once   # single cycle (for cron)
 
-Environment variables (required):
-    TELEGRAM_BOT_TOKEN   - Telegram bot token (from @BotFather)
-    TELEGRAM_CHAT_ID     - Target chat/channel ID
+Required environment variables:
+    TELEGRAM_BOT_TOKEN       Telegram bot token (from @BotFather)
+    TELEGRAM_CHAT_ID         Target chat / channel ID
+    ETHERSCAN_API_KEY        Etherscan API key (https://etherscan.io/myapikey)
 
-Environment variables (optional):
-    CHECK_INTERVAL_SECS  - Polling interval in seconds (default: 3600 = 1h)
-    STATE_FILE           - Path to JSON file for persisting seen IDs
-                           (default: ./sec_alphaton_state.json)
-    LOOKBACK_DAYS        - How many days back to look on first run (default: 30)
+Optional environment variables:
+    SEC_CHECK_INTERVAL_SECS  How often to poll SEC  (default: 3600)
+    ETH_CHECK_INTERVAL_SECS  How often to poll Etherscan (default: 300)
+    LOOKBACK_DAYS            Days back to look on first SEC run (default: 30)
+    ETH_LOOKBACK_BLOCKS      Blocks back to scan on first Etherscan run (default: 7200 ≈ 1 day)
+    MIN_TOKEN_AMOUNT         Minimum transfer size to alert on (default: 500000)
+    STATE_FILE               Path to state JSON file (default: ./alphaton_state.json)
 """
 
 import os
@@ -26,11 +38,12 @@ import time
 import logging
 import datetime
 import hashlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,19 +54,26 @@ log = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_SECS", "3600"))
-STATE_FILE         = Path(os.environ.get("STATE_FILE", "sec_alphaton_state.json"))
-LOOKBACK_DAYS      = int(os.environ.get("LOOKBACK_DAYS", "30"))
+TELEGRAM_BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
+ETHERSCAN_API_KEY       = os.environ.get("ETHERSCAN_API_KEY", "")
 
-SEARCH_TERM = "AlphaTon"
+SEC_CHECK_INTERVAL      = int(os.environ.get("SEC_CHECK_INTERVAL_SECS", "3600"))
+ETH_CHECK_INTERVAL      = int(os.environ.get("ETH_CHECK_INTERVAL_SECS", "300"))
+LOOKBACK_DAYS           = int(os.environ.get("LOOKBACK_DAYS", "30"))
+ETH_LOOKBACK_BLOCKS     = int(os.environ.get("ETH_LOOKBACK_BLOCKS", "7200"))
+MIN_TOKEN_AMOUNT        = float(os.environ.get("MIN_TOKEN_AMOUNT", "500000"))
+STATE_FILE              = Path(os.environ.get("STATE_FILE", "alphaton_state.json"))
 
-# SEC requires a descriptive User-Agent with contact info.
-# See: https://www.sec.gov/developer
+SEC_SEARCH_TERM   = "AlphaTon"
+TOKEN_CONTRACT    = "0xd9016a907dc0ecfa3ca425ab20b6b785b42f2373"
+TRANSFER_SIG      = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f09b014dfee7de117a1a836f29"
+
+# SEC requires a descriptive User-Agent with contact info
+# https://www.sec.gov/developer
 SEC_HEADERS = {
-    "User-Agent": "AlphaTon-Monitor sec-alerts@pisosganga.com",
-    "Accept":     "application/json",
+    "User-Agent": "AlphaTon-Monitor alerts@pisosganga.com",
+    "Accept":     "application/json, application/xml, text/xml",
 }
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -64,7 +84,15 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception as exc:
             log.warning("Could not read state file (%s). Starting fresh.", exc)
-    return {"seen_edgar": [], "seen_news": []}
+    return {
+        "seen_edgar":   [],
+        "seen_news":    [],
+        "seen_company": [],
+        "eth_last_block": 0,
+        "eth_seen_tx":  [],
+        "token_decimals": None,
+        "token_symbol":   None,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -78,11 +106,11 @@ def send_telegram(text: str) -> bool:
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — cannot send alert.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       text,
-        "parse_mode": "HTML",
+        "chat_id":                  TELEGRAM_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
         "disable_web_page_preview": False,
     }
     try:
@@ -96,147 +124,79 @@ def send_telegram(text: str) -> bool:
     return False
 
 
-# ── SEC EDGAR full-text search ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEC EDGAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_edgar_filings(start_date: str) -> list[dict]:
-    """
-    Query EDGAR EFTS (full-text search) for documents mentioning AlphaTon.
-    Returns a list of hit dicts.
-    """
-    url = "https://efts.sec.gov/LATEST/search-index"
+def _edgar_fetch_filings(start_date: str) -> list:
+    url    = "https://efts.sec.gov/LATEST/search-index"
     params = {
-        "q":          f'"{SEARCH_TERM}"',
-        "dateRange":  "custom",
-        "startdt":    start_date,
-        "enddt":      datetime.date.today().isoformat(),
-        "_source":    "entity_name,file_date,form_type,period_of_report,file_num,id",
-        "hits.hits.total.value": 40,
+        "q":         f'"{SEC_SEARCH_TERM}"',
+        "dateRange": "custom",
+        "startdt":   start_date,
+        "enddt":     datetime.date.today().isoformat(),
+        "_source":   "entity_name,file_date,form_type,period_of_report,file_num,id",
     }
-
     try:
         resp = requests.get(url, params=params, headers=SEC_HEADERS, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("hits", {}).get("hits", [])
-    except requests.HTTPError as exc:
-        log.warning("EDGAR search HTTP error: %s", exc)
+        return resp.json().get("hits", {}).get("hits", [])
     except Exception as exc:
-        log.warning("EDGAR search failed: %s", exc)
+        log.warning("EDGAR full-text search error: %s", exc)
     return []
 
 
-def filing_to_message(hit: dict) -> str:
+def _edgar_filing_msg(hit: dict) -> str:
     src  = hit.get("_source", {})
     eid  = hit.get("_id", "")
     name = src.get("entity_name", "N/A")
     date = src.get("file_date", "N/A")
     form = src.get("form_type", "N/A")
-
-    # Build EDGAR filing URL from accession number (the _id field)
-    # Format: 0001234567-24-000001  →  Archives/edgar/data/CIK/0001234567-24-000001
-    accession = eid.replace("-", "")
-    edgar_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={src.get('file_num', '')}&type={form}&dateb=&owner=include&count=10&search_text="
-
-    # Simpler direct link to the filing index
-    cik_part  = accession[:10].lstrip("0") if accession else ""
-    filing_url = (
-        f"https://www.sec.gov/Archives/edgar/data/{cik_part}/{eid.replace('-','')}-index.htm"
-        if accession else "https://efts.sec.gov/LATEST/search-index?q=%22AlphaTon%22"
-    )
-
+    search_url = "https://efts.sec.gov/LATEST/search-index?q=%22AlphaTon%22"
     return (
-        f"🔔 <b>Nueva presentación SEC sobre {SEARCH_TERM}</b>\n\n"
+        f"🔔 <b>Nueva presentación SEC — {SEC_SEARCH_TERM}</b>\n\n"
         f"<b>Entidad:</b> {name}\n"
         f"<b>Formulario:</b> {form}\n"
         f"<b>Fecha:</b> {date}\n"
-        f"<b>ID:</b> {eid}\n\n"
-        f'🔗 <a href="{filing_url}">Ver presentación en EDGAR</a>\n'
-        f'🔍 <a href="https://efts.sec.gov/LATEST/search-index?q=%22AlphaTon%22">Buscar más en EDGAR</a>'
+        f"<b>ID:</b> <code>{eid}</code>\n\n"
+        f'🔗 <a href="{search_url}">Ver en EDGAR</a>'
     )
 
 
 def check_edgar(state: dict) -> int:
-    """Check EDGAR for new filings. Returns count of new alerts sent."""
-    start_date = (
-        datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)
-    ).isoformat()
+    start = (datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
+    hits  = _edgar_fetch_filings(start)
+    log.info("EDGAR: %d hit(s) for '%s'.", len(hits), SEC_SEARCH_TERM)
 
-    hits = fetch_edgar_filings(start_date)
-    log.info("EDGAR: %d hit(s) found for '%s'.", len(hits), SEARCH_TERM)
-
-    seen  = set(state["seen_edgar"])
-    new_alerts = 0
-
+    seen = set(state["seen_edgar"])
+    sent = 0
     for hit in hits:
-        hit_id = hit.get("_id", "")
-        if not hit_id or hit_id in seen:
+        hid = hit.get("_id", "")
+        if not hid or hid in seen:
             continue
-
-        log.info("  → New EDGAR filing: %s", hit_id)
-        msg = filing_to_message(hit)
-        if send_telegram(msg):
-            seen.add(hit_id)
-            new_alerts += 1
-        time.sleep(1)  # rate-limit
+        log.info("  → New EDGAR filing: %s", hid)
+        if send_telegram(_edgar_filing_msg(hit)):
+            seen.add(hid)
+            sent += 1
+        time.sleep(1)
 
     state["seen_edgar"] = list(seen)
-    return new_alerts
+    return sent
 
 
-# ── SEC News / Press releases ─────────────────────────────────────────────────
+# ── SEC RSS feeds (press releases, litigation, admin actions) ─────────────────
 
-def fetch_sec_news_rss() -> list[dict]:
-    """
-    Parse the SEC press-release RSS feed and return items whose title or
-    description mentions SEARCH_TERM (case-insensitive).
-    """
-    import xml.etree.ElementTree as ET
-
-    rss_urls = [
-        "https://www.sec.gov/rss/news/pressreleases.xml",
-        "https://www.sec.gov/litigation/litreleases.xml",
-        "https://www.sec.gov/litigation/admin.xml",
-    ]
-
-    items = []
-    term_lower = SEARCH_TERM.lower()
-
-    for rss_url in rss_urls:
-        try:
-            resp = requests.get(rss_url, headers=SEC_HEADERS, timeout=20)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.text)
-            channel = root.find("channel")
-            if channel is None:
-                continue
-            for item in channel.findall("item"):
-                title = item.findtext("title", "")
-                desc  = item.findtext("description", "")
-                link  = item.findtext("link", "")
-                date  = item.findtext("pubDate", "")
-                if term_lower in title.lower() or term_lower in desc.lower():
-                    items.append({
-                        "id":    hashlib.sha1(link.encode()).hexdigest(),
-                        "title": title,
-                        "link":  link,
-                        "date":  date,
-                        "feed":  rss_url.split("/")[-1],
-                    })
-        except Exception as exc:
-            log.warning("RSS fetch failed (%s): %s", rss_url, exc)
-
-    return items
+_RSS_FEEDS = [
+    ("pressreleases.xml",  "https://www.sec.gov/rss/news/pressreleases.xml",       "Nota de prensa"),
+    ("litreleases.xml",    "https://www.sec.gov/litigation/litreleases.xml",        "Acción legal"),
+    ("admin.xml",          "https://www.sec.gov/litigation/admin.xml",              "Acción administrativa"),
+]
 
 
-def news_to_message(item: dict) -> str:
-    feed_label = {
-        "pressreleases.xml":  "Nota de prensa",
-        "litreleases.xml":    "Acción legal (Litigation Release)",
-        "admin.xml":          "Acción administrativa",
-    }.get(item.get("feed", ""), "Noticia SEC")
-
+def _rss_news_msg(item: dict) -> str:
+    label = item.get("label", "Noticia SEC")
     return (
-        f"🚨 <b>SEC – {feed_label} sobre {SEARCH_TERM}</b>\n\n"
+        f"🚨 <b>SEC — {label} sobre {SEC_SEARCH_TERM}</b>\n\n"
         f"<b>{item['title']}</b>\n"
         f"<i>{item['date']}</i>\n\n"
         f'🔗 <a href="{item["link"]}">Leer noticia completa</a>'
@@ -244,131 +204,308 @@ def news_to_message(item: dict) -> str:
 
 
 def check_sec_news(state: dict) -> int:
-    """Check SEC RSS news feeds. Returns count of new alerts sent."""
-    items = fetch_sec_news_rss()
-    log.info("SEC News RSS: %d match(es) for '%s'.", len(items), SEARCH_TERM)
+    term  = SEC_SEARCH_TERM.lower()
+    seen  = set(state["seen_news"])
+    sent  = 0
 
-    seen = set(state["seen_news"])
-    new_alerts = 0
+    for _fname, rss_url, label in _RSS_FEEDS:
+        try:
+            resp = requests.get(rss_url, headers=SEC_HEADERS, timeout=20)
+            resp.raise_for_status()
+            root    = ET.fromstring(resp.text)
+            channel = root.find("channel")
+            if channel is None:
+                continue
+            for item_el in channel.findall("item"):
+                title = item_el.findtext("title", "")
+                desc  = item_el.findtext("description", "")
+                link  = item_el.findtext("link", "")
+                date  = item_el.findtext("pubDate", "")
+                if term not in title.lower() and term not in desc.lower():
+                    continue
+                uid = hashlib.sha1(link.encode()).hexdigest()
+                if uid in seen:
+                    continue
+                log.info("  → New SEC news (%s): %s", label, title)
+                item = {"title": title, "link": link, "date": date, "label": label}
+                if send_telegram(_rss_news_msg(item)):
+                    seen.add(uid)
+                    sent += 1
+                time.sleep(1)
+        except Exception as exc:
+            log.warning("RSS fetch failed (%s): %s", rss_url, exc)
 
-    for item in items:
-        if item["id"] in seen:
-            continue
-
-        log.info("  → New SEC news: %s", item["title"])
-        msg = news_to_message(item)
-        if send_telegram(msg):
-            seen.add(item["id"])
-            new_alerts += 1
-        time.sleep(1)
-
+    log.info("SEC News: %d new alert(s).", sent)
     state["seen_news"] = list(seen)
-    return new_alerts
+    return sent
 
 
-# ── EDGAR company-level search (backup) ──────────────────────────────────────
+# ── EDGAR company-level search (Atom feed) ────────────────────────────────────
 
-def check_edgar_company_search(state: dict) -> int:
-    """
-    Fallback: query the EDGAR company search Atom feed for 'AlphaTon'.
-    Useful if full-text search is unavailable.
-    """
-    import xml.etree.ElementTree as ET
+_ATOM_NS = "http://www.w3.org/2005/Atom"
 
-    url = "https://www.sec.gov/cgi-bin/browse-edgar"
+
+def check_edgar_company(state: dict) -> int:
+    url    = "https://www.sec.gov/cgi-bin/browse-edgar"
     params = {
-        "action":      "getcompany",
-        "company":     SEARCH_TERM,
-        "type":        "",
-        "dateb":       "",
-        "owner":       "include",
-        "count":       "40",
-        "search_text": "",
-        "output":      "atom",
+        "action": "getcompany", "company": SEC_SEARCH_TERM,
+        "type": "", "dateb": "", "owner": "include",
+        "count": "40", "search_text": "", "output": "atom",
     }
-    NS = "http://www.w3.org/2005/Atom"
-
     seen = set(state.get("seen_company", []))
-    new_alerts = 0
-
+    sent = 0
     try:
         resp = requests.get(url, params=params, headers=SEC_HEADERS, timeout=20)
         resp.raise_for_status()
         root = ET.fromstring(resp.text)
-
-        for entry in root.findall(f"{{{NS}}}entry"):
-            entry_id   = entry.findtext(f"{{{NS}}}id", "")
-            entry_title = entry.findtext(f"{{{NS}}}title", "")
-            entry_link_el = entry.find(f"{{{NS}}}link")
-            entry_link = entry_link_el.get("href", "") if entry_link_el is not None else ""
-            updated    = entry.findtext(f"{{{NS}}}updated", "")
-
-            uid = hashlib.sha1(entry_id.encode()).hexdigest()
+        for entry in root.findall(f"{{{_ATOM_NS}}}entry"):
+            eid   = entry.findtext(f"{{{_ATOM_NS}}}id", "")
+            title = entry.findtext(f"{{{_ATOM_NS}}}title", "")
+            link_el = entry.find(f"{{{_ATOM_NS}}}link")
+            link  = link_el.get("href", "") if link_el is not None else ""
+            upd   = entry.findtext(f"{{{_ATOM_NS}}}updated", "")
+            uid   = hashlib.sha1(eid.encode()).hexdigest()
             if uid in seen:
                 continue
-
-            log.info("  → New EDGAR company entry: %s", entry_title)
+            log.info("  → New EDGAR company: %s", title)
             msg = (
-                f"📋 <b>Empresa en EDGAR relacionada con {SEARCH_TERM}</b>\n\n"
-                f"<b>{entry_title}</b>\n"
-                f"<i>Actualizado: {updated}</i>\n\n"
-                f'🔗 <a href="{entry_link}">Ver en EDGAR</a>'
+                f"📋 <b>Empresa en EDGAR — {SEC_SEARCH_TERM}</b>\n\n"
+                f"<b>{title}</b>\n<i>{upd}</i>\n\n"
+                f'🔗 <a href="{link}">Ver en EDGAR</a>'
             )
             if send_telegram(msg):
                 seen.add(uid)
-                new_alerts += 1
+                sent += 1
             time.sleep(1)
-
     except Exception as exc:
         log.warning("EDGAR company search failed: %s", exc)
 
     state["seen_company"] = list(seen)
-    return new_alerts
+    return sent
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+def run_sec_checks(state: dict) -> int:
+    log.info("── SEC check ────────────────────────────────")
+    total  = check_edgar(state)
+    total += check_sec_news(state)
+    total += check_edgar_company(state)
+    log.info("SEC check done. %d new alert(s).", total)
+    return total
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ETHERSCAN — ERC-20 token transfer monitor
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ETHERSCAN_BASE = "https://api.etherscan.io/api"
+
+
+def _eth_get(params: dict) -> dict:
+    """Make an Etherscan API call and return the parsed JSON."""
+    params.setdefault("apikey", ETHERSCAN_API_KEY)
+    resp = requests.get(_ETHERSCAN_BASE, params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _eth_latest_block() -> int:
+    data = _eth_get({"module": "proxy", "action": "eth_blockNumber"})
+    return int(data["result"], 16)
+
+
+def _eth_token_info(state: dict) -> tuple[str, int]:
+    """Return (symbol, decimals), cached in state."""
+    if state.get("token_decimals") and state.get("token_symbol"):
+        return state["token_symbol"], state["token_decimals"]
+
+    try:
+        data = _eth_get({
+            "module":          "token",
+            "action":          "tokeninfo",
+            "contractaddress": TOKEN_CONTRACT,
+        })
+        if data.get("status") == "1" and data.get("result"):
+            info = data["result"]
+            if isinstance(info, list):
+                info = info[0]
+            symbol   = info.get("symbol", "TOKEN")
+            decimals = int(info.get("divisor", info.get("decimals", "18")))
+            state["token_symbol"]   = symbol
+            state["token_decimals"] = decimals
+            log.info("Token info: %s, %d decimals", symbol, decimals)
+            return symbol, decimals
+    except Exception as exc:
+        log.warning("Could not fetch token info: %s. Assuming 18 decimals.", exc)
+
+    state["token_symbol"]   = "TOKEN"
+    state["token_decimals"] = 18
+    return "TOKEN", 18
+
+
+def _decode_transfer(log_entry: dict, decimals: int) -> dict:
+    """Decode a raw Transfer event log entry."""
+    topics    = log_entry.get("topics", [])
+    from_addr = "0x" + topics[1][-40:] if len(topics) > 1 else "0x?"
+    to_addr   = "0x" + topics[2][-40:] if len(topics) > 2 else "0x?"
+    raw_val   = int(log_entry.get("data", "0x0"), 16)
+    amount    = raw_val / (10 ** decimals)
+    tx_hash   = log_entry.get("transactionHash", "")
+    block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+    return {
+        "from":   from_addr,
+        "to":     to_addr,
+        "amount": amount,
+        "tx":     tx_hash,
+        "block":  block_num,
+    }
+
+
+def _transfer_msg(t: dict, symbol: str) -> str:
+    amount_fmt = f"{t['amount']:,.0f}"
+    short_from = t["from"][:6] + "…" + t["from"][-4:]
+    short_to   = t["to"][:6]   + "…" + t["to"][-4:]
+    tx_url     = f"https://etherscan.io/tx/{t['tx']}"
+    from_url   = f"https://etherscan.io/address/{t['from']}"
+    to_url     = f"https://etherscan.io/address/{t['to']}"
+    token_url  = f"https://etherscan.io/token/{TOKEN_CONTRACT}"
+
+    return (
+        f"💸 <b>Gran transferencia {symbol}</b> — {amount_fmt} tokens\n\n"
+        f"<b>De:</b>  <a href=\"{from_url}\">{short_from}</a>\n"
+        f"<b>A:</b>   <a href=\"{to_url}\">{short_to}</a>\n"
+        f"<b>Bloque:</b> {t['block']:,}\n\n"
+        f'🔗 <a href="{tx_url}">Ver tx en Etherscan</a>\n'
+        f'📊 <a href="{token_url}">Ver token en Etherscan</a>'
+    )
+
+
+def check_etherscan(state: dict) -> int:
+    if not ETHERSCAN_API_KEY:
+        log.warning("ETHERSCAN_API_KEY not set — skipping Etherscan check.")
+        return 0
+
+    symbol, decimals = _eth_token_info(state)
+
+    try:
+        latest_block = _eth_latest_block()
+    except Exception as exc:
+        log.warning("Could not get latest block: %s", exc)
+        return 0
+
+    last_block = state.get("eth_last_block", 0)
+    if last_block == 0:
+        last_block = latest_block - ETH_LOOKBACK_BLOCKS
+
+    if latest_block <= last_block:
+        log.info("Etherscan: no new blocks (latest=%d).", latest_block)
+        return 0
+
+    # Etherscan getLogs supports max ~10 000 blocks per call
+    from_block = last_block + 1
+    to_block   = min(latest_block, from_block + 9999)
+
+    log.info("Etherscan: scanning blocks %d → %d for %s transfers >= %s.",
+             from_block, to_block, symbol, f"{MIN_TOKEN_AMOUNT:,.0f}")
+
+    try:
+        data = _eth_get({
+            "module":    "logs",
+            "action":    "getLogs",
+            "address":   TOKEN_CONTRACT,
+            "topic0":    TRANSFER_SIG,
+            "fromBlock": from_block,
+            "toBlock":   to_block,
+        })
+    except Exception as exc:
+        log.warning("Etherscan getLogs error: %s", exc)
+        return 0
+
+    if data.get("status") not in ("1", 1) and not data.get("result"):
+        log.info("Etherscan: no Transfer events in range.")
+        state["eth_last_block"] = to_block
+        return 0
+
+    raw_logs = data.get("result", [])
+    log.info("Etherscan: %d Transfer event(s) in range.", len(raw_logs))
+
+    seen = set(state.get("eth_seen_tx", []))
+    sent = 0
+
+    for entry in raw_logs:
+        t = _decode_transfer(entry, decimals)
+
+        if t["tx"] in seen:
+            continue
+        if t["amount"] < MIN_TOKEN_AMOUNT:
+            continue
+
+        log.info("  → Large transfer: %.0f %s  tx=%s", t["amount"], symbol, t["tx"])
+        if send_telegram(_transfer_msg(t, symbol)):
+            seen.add(t["tx"])
+            sent += 1
+        time.sleep(0.5)
+
+    state["eth_last_block"] = to_block
+    # Keep seen list bounded (last 2000 tx hashes is plenty)
+    state["eth_seen_tx"] = list(seen)[-2000:]
+    log.info("Etherscan check done. %d new alert(s).", sent)
+    return sent
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Main loop
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_once():
-    """Run a single check cycle across all sources."""
+    """Single cycle: run all checks once and save state."""
     state = load_state()
-
-    total = 0
-    total += check_edgar(state)
-    total += check_sec_news(state)
-    total += check_edgar_company_search(state)
-
+    total  = run_sec_checks(state)
+    total += check_etherscan(state)
     save_state(state)
-    log.info("Cycle done. %d new alert(s) sent.", total)
+    log.info("Full cycle done. %d new alert(s) sent.", total)
     return total
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        log.error("Set TELEGRAM_BOT_TOKEN environment variable before running.")
+        log.error("Set TELEGRAM_BOT_TOKEN before running.")
         sys.exit(1)
     if not TELEGRAM_CHAT_ID:
-        log.error("Set TELEGRAM_CHAT_ID environment variable before running.")
+        log.error("Set TELEGRAM_CHAT_ID before running.")
         sys.exit(1)
+    if not ETHERSCAN_API_KEY:
+        log.warning("ETHERSCAN_API_KEY not set — Etherscan monitoring disabled.")
 
-    log.info("SEC AlphaTon Monitor started. Interval: %ds", CHECK_INTERVAL)
-    log.info("Monitoring search term: '%s'", SEARCH_TERM)
-    log.info("State file: %s", STATE_FILE)
+    log.info("AlphaTon Monitor started (SEC + Etherscan).")
+    log.info("  SEC check every %ds, Etherscan every %ds.", SEC_CHECK_INTERVAL, ETH_CHECK_INTERVAL)
+    log.info("  Token contract : %s", TOKEN_CONTRACT)
+    log.info("  Min transfer   : %s tokens", f"{MIN_TOKEN_AMOUNT:,.0f}")
+
+    last_sec = 0.0
+    last_eth = 0.0
 
     while True:
+        now   = time.monotonic()
+        state = load_state()
+
+        if now - last_sec >= SEC_CHECK_INTERVAL:
+            run_sec_checks(state)
+            save_state(state)
+            last_sec = now
+
+        if now - last_eth >= ETH_CHECK_INTERVAL:
+            check_etherscan(state)
+            save_state(state)
+            last_eth = now
+
         try:
-            run_once()
+            time.sleep(60)   # wake up every minute to check which timer fired
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             break
-        except Exception as exc:
-            log.error("Unexpected error in cycle: %s", exc, exc_info=True)
-
-        log.info("Sleeping %d seconds until next check…", CHECK_INTERVAL)
-        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    # Allow a one-shot mode: python3 sec_alphaton_monitor.py --once
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
         run_once()
     else:
