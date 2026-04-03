@@ -67,7 +67,7 @@ STATE_FILE              = Path(os.environ.get("STATE_FILE", "alphaton_state.json
 
 SEC_SEARCH_TERM   = "AlphaTon"
 TOKEN_CONTRACT    = "0xd9016a907dc0ecfa3ca425ab20b6b785b42f2373"
-TRANSFER_SIG      = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f09b014dfee7de117a1a836f29"
+TRANSFER_SIG      = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 # SEC requires a descriptive User-Agent with contact info
 # https://www.sec.gov/developer
