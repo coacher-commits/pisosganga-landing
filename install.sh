@@ -31,7 +31,7 @@ cp /tmp/alphaton-repo/sec-alphaton-monitor.service /etc/systemd/system/${SERVICE
 rm -rf /tmp/alphaton-repo
 
 echo "==> Instalando dependencias Python"
-pip3 install --quiet requests
+apt-get install -y python3-requests
 
 echo "==> Configurando permisos"
 chown -R root:root "$INSTALL_DIR"
