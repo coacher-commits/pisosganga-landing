@@ -187,7 +187,7 @@ def check_edgar(state: dict) -> int:
 # ── SEC RSS feeds (press releases, litigation, admin actions) ─────────────────
 
 _RSS_FEEDS = [
-    ("pressreleases.xml",  "https://www.sec.gov/rss/news/pressreleases.xml",       "Nota de prensa"),
+    ("pressreleases.xml",  "https://www.sec.gov/newsroom/pressreleases.rss",       "Nota de prensa"),
     ("litreleases.xml",    "https://www.sec.gov/litigation/litreleases.xml",        "Acción legal"),
     ("admin.xml",          "https://www.sec.gov/litigation/admin.xml",              "Acción administrativa"),
 ]
