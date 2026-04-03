@@ -7,28 +7,7 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/alphaton-monitor
-
-# ── Required ──────────────────────────────────────────────────────────────────
-Environment="TELEGRAM_BOT_TOKEN=REPLACE_ME"
-Environment="TELEGRAM_CHAT_ID=REPLACE_ME"
-Environment="ETHERSCAN_API_KEY=REPLACE_ME"
-
-# ── SEC options ───────────────────────────────────────────────────────────────
-# How often to poll the SEC (seconds). Default: 3600 (1 hour)
-Environment="SEC_CHECK_INTERVAL_SECS=3600"
-# How many days back to look on the very first run
-Environment="LOOKBACK_DAYS=30"
-
-# ── Etherscan options ─────────────────────────────────────────────────────────
-# How often to poll Etherscan (seconds). Default: 300 (5 minutes)
-Environment="ETH_CHECK_INTERVAL_SECS=300"
-# How many blocks back to scan on first run (≈ 7200 blocks ≈ 1 day)
-Environment="ETH_LOOKBACK_BLOCKS=7200"
-# Minimum token transfer size to trigger an alert
-Environment="MIN_TOKEN_AMOUNT=500000"
-
-# ── State / misc ──────────────────────────────────────────────────────────────
-Environment="STATE_FILE=/opt/alphaton-monitor/state.json"
+EnvironmentFile=/opt/alphaton-monitor/.env
 
 ExecStart=/usr/bin/python3 /opt/alphaton-monitor/sec_alphaton_monitor.py
 Restart=on-failure
