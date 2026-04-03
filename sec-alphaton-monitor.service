@@ -1,0 +1,32 @@
+[Unit]
+Description=SEC AlphaTon Alert Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/sec-alphaton-monitor
+
+# ── Required ──────────────────────────────────────────────────────────────────
+Environment="TELEGRAM_BOT_TOKEN=REPLACE_ME"
+Environment="TELEGRAM_CHAT_ID=REPLACE_ME"
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+# How often to check (seconds). Default: 3600 (1 hour)
+Environment="CHECK_INTERVAL_SECS=3600"
+# How many days back to look on the very first run
+Environment="LOOKBACK_DAYS=30"
+# Where to persist the list of already-seen IDs
+Environment="STATE_FILE=/opt/sec-alphaton-monitor/state.json"
+
+ExecStart=/usr/bin/python3 /opt/sec-alphaton-monitor/sec_alphaton_monitor.py
+Restart=on-failure
+RestartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sec-alphaton-monitor
+
+[Install]
+WantedBy=multi-user.target
