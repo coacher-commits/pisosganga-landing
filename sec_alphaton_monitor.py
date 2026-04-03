@@ -297,12 +297,14 @@ def run_sec_checks(state: dict) -> int:
 #  ETHERSCAN — ERC-20 token transfer monitor
 # ══════════════════════════════════════════════════════════════════════════════
 
-_ETHERSCAN_BASE = "https://api.etherscan.io/api"
+_ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
+_ETHERSCAN_CHAIN_ID = "1"
 
 
 def _eth_get(params: dict) -> dict:
     """Make an Etherscan API call and return the parsed JSON."""
     params.setdefault("apikey", ETHERSCAN_API_KEY)
+    params.setdefault("chainid", _ETHERSCAN_CHAIN_ID)
     resp = requests.get(_ETHERSCAN_BASE, params=params, timeout=20)
     resp.raise_for_status()
     return resp.json()
