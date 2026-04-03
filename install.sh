@@ -11,6 +11,17 @@ SERVICE_NAME="alphaton-monitor"
 echo "==> Creando directorio $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
+echo "==> Escribiendo credenciales"
+cat > "$INSTALL_DIR/.env" << 'ENVEOF'
+TELEGRAM_BOT_TOKEN=8600945320:AAF0RpFpj82WRrJSEFu39-sjj9JC4kHyuJk
+TELEGRAM_CHAT_ID=335742617
+ETHERSCAN_API_KEY=72HP2BJF551NDHK7G8S8G4S72MCS9X4FHY
+SEC_CHECK_INTERVAL_SECS=3600
+ETH_CHECK_INTERVAL_SECS=300
+MIN_TOKEN_AMOUNT=500000
+STATE_FILE=/opt/alphaton-monitor/state.json
+ENVEOF
+
 echo "==> Descargando archivos del repositorio"
 apt-get install -y --quiet git python3-pip 2>/dev/null || true
 git clone --depth 1 --branch "$BRANCH" "$REPO" /tmp/alphaton-repo 2>/dev/null || \
@@ -23,7 +34,7 @@ echo "==> Instalando dependencias Python"
 pip3 install --quiet requests
 
 echo "==> Configurando permisos"
-chown -R ubuntu:ubuntu "$INSTALL_DIR"
+chown -R root:root "$INSTALL_DIR"
 chmod 600 "$INSTALL_DIR/.env"
 
 echo "==> Activando servicio"
